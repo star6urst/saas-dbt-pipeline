@@ -57,7 +57,14 @@ DROP_CLIENT_IDX = 8                     # outage-driven usage drop
 
 
 def random_signup_date(idx):
-    """Most clients start on day one; a handful join partway through the year."""
+    """Most clients start on day one; a handful join partway through the year.
+
+    The two anomaly-target clients (SPIKE_CLIENT_IDX, DROP_CLIENT_IDX) are
+    forced to sign up on day one, so the hardcoded anomaly injection windows
+    always land on a date where that client actually has usage data.
+    """
+    if idx in (SPIKE_CLIENT_IDX, DROP_CLIENT_IDX):
+        return START_DATE
     if idx % 4 == 0 and idx != 0:
         offset_days = random.randint(30, 300)
         return START_DATE + timedelta(days=offset_days)
