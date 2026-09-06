@@ -1,15 +1,21 @@
 """
 Generate a synthetic multi-tenant B2B SaaS dataset and load it into BigQuery.
 
-Produces three raw tables in the `saas_raw` dataset:
+Produces four raw tables in the `saas_raw` dataset:
   - clients               one row per client (tenant)
   - subscription_events   plan signup/upgrade/downgrade/churn history
   - daily_usage           daily usage metrics per client
+  - experiment_assignments  treatment/control group per client for a
+                             simulated feature-launch A/B test
 
 Designed to include realistic messiness: staggered signups, churn,
 plan changes, a missing-data window, and injected usage anomalies
 (a spike and a drop) so downstream dbt models have something real
-to detect.
+to detect. Also embeds a genuine randomized experiment: eligible
+clients (active as of the eligibility date) are randomly assigned to
+treatment/control, stratified by plan tier, and treatment clients get
+a real (noisy, per-client) usage uplift starting from the launch date
+-- on active_users and feature_usage_count only, not api_calls.
 """
 
 import random
@@ -54,6 +60,14 @@ PLAN_CHANGE_CLIENT_IDXS = [1, 4, 7, 12] # will upgrade/downgrade mid-year
 MISSING_DATA_CLIENT_IDXS = [5, 11]      # will have a broken-tracking window
 SPIKE_CLIENT_IDX = 3                    # viral usage spike
 DROP_CLIENT_IDX = 8                     # outage-driven usage drop
+
+# --- A/B test (feature launch) config ---
+ANALYSIS_START_DATE = date(2025, 9, 1)           # start of the "pre" comparison period
+EXPERIMENT_LAUNCH_DATE = date(2025, 10, 1)
+EXPERIMENT_ELIGIBILITY_DATE = date(2025, 9, 30)  # must be active (not churned) as of this date
+ANALYSIS_END_DATE = date(2025, 10, 31)           # end of the "post" comparison period
+TREATMENT_UPLIFT_MEAN = 0.15   # average true effect: +15% on active_users / feature_usage_count
+TREATMENT_UPLIFT_SD = 0.05     # per-client heterogeneity in the effect
 
 
 def random_signup_date(idx):
@@ -158,12 +172,83 @@ def get_active_plan(sub_events, client_id, as_of_date):
     return None if latest["event_type"] == "churn" else latest["plan_tier"]
 
 
-def build_daily_usage(clients_df, sub_events):
+def build_experiment_assignments(clients_df, sub_events_df):
+    """Randomly assign eligible clients to treatment/control, stratified by
+    plan tier as of the eligibility date. Churned clients are excluded
+    entirely (not part of the experiment).
+
+    Returns:
+        assignment_df: client_id, plan_tier_at_assignment, group
+        uplift_by_client: dict of client_id -> true uplift multiplier
+                           (ground truth, not written to any raw table)
+    """
+    # clients whose usage history already contains a one-off injected
+    # anomaly (spike/drop) are excluded from the experiment entirely --
+    # an anomaly landing inside the analysis window would otherwise be
+    # mistaken for a treatment or control effect
+    anomaly_client_ids = {
+        clients_df.iloc[SPIKE_CLIENT_IDX]["client_id"],
+        clients_df.iloc[DROP_CLIENT_IDX]["client_id"],
+    }
+
+    eligible_rows = []
+    for _, client in clients_df.iterrows():
+        client_id = client["client_id"]
+        if client_id in anomaly_client_ids:
+            continue
+
+        plan = get_active_plan(sub_events_df, client_id, EXPERIMENT_ELIGIBILITY_DATE)
+        if plan is None:
+            continue  # churned (or not yet signed up) by the eligibility date
+
+        # exclude clients with any subscription event (signup, plan change,
+        # or churn) falling inside the pre+post analysis window itself --
+        # such an event would make the pre-period baseline or the post-period
+        # outcome inconsistent, and could be mistaken for a treatment effect
+        disruptive_events = sub_events_df[
+            (sub_events_df["client_id"] == client_id)
+            & (sub_events_df["event_date"] > ANALYSIS_START_DATE)
+            & (sub_events_df["event_date"] <= ANALYSIS_END_DATE)
+        ]
+        if not disruptive_events.empty:
+            continue
+
+        eligible_rows.append({"client_id": client_id, "plan_tier_at_assignment": plan})
+
+    eligible_df = pd.DataFrame(eligible_rows)
+
+    assignments = []
+    for plan_tier, group_df in eligible_df.groupby("plan_tier_at_assignment"):
+        client_ids = list(group_df["client_id"])
+        random.shuffle(client_ids)
+        half = len(client_ids) // 2
+        treatment_ids = set(client_ids[:half])
+        for cid in client_ids:
+            assignments.append(
+                {
+                    "client_id": cid,
+                    "plan_tier_at_assignment": plan_tier,
+                    "group": "treatment" if cid in treatment_ids else "control",
+                }
+            )
+
+    assignment_df = pd.DataFrame(assignments)
+
+    uplift_by_client = {}
+    for cid in assignment_df.loc[assignment_df["group"] == "treatment", "client_id"]:
+        uplift_by_client[cid] = max(0.0, np.random.normal(TREATMENT_UPLIFT_MEAN, TREATMENT_UPLIFT_SD))
+
+    return assignment_df, uplift_by_client
+
+
+def build_daily_usage(clients_df, sub_events, uplift_by_client=None):
+    uplift_by_client = uplift_by_client or {}
     rows = []
 
     for idx, client in clients_df.iterrows():
         client_id = client["client_id"]
         signup = pd.Timestamp(client["signup_date"])
+        client_uplift = uplift_by_client.get(client_id, 0.0)
 
         # find churn date, if any, for this client
         churn_rows = sub_events[
@@ -206,6 +291,12 @@ def build_daily_usage(clients_df, sub_events):
             feature_usage = max(0, int(plan_cfg["base_features"] * multiplier))
             api_calls = max(0, int(plan_cfg["base_api"] * multiplier))
 
+            # --- A/B test uplift: treatment clients, from launch date onward,
+            #     on active_users and feature_usage_count only (not api_calls) ---
+            if client_uplift > 0 and day.date() >= EXPERIMENT_LAUNCH_DATE:
+                active_users = max(0, int(active_users * (1 + client_uplift)))
+                feature_usage = max(0, int(feature_usage * (1 + client_uplift)))
+
             rows.append(
                 {
                     "client_id": client_id,
@@ -235,16 +326,31 @@ def main():
     print("Generating subscription events...")
     sub_events_df = build_subscription_events(clients_df)
 
+    print("Generating experiment (A/B test) assignments...")
+    assignment_df, uplift_by_client = build_experiment_assignments(clients_df, sub_events_df)
+
     print("Generating daily usage (this is the slow part)...")
-    usage_df = build_daily_usage(clients_df, sub_events_df)
+    usage_df = build_daily_usage(clients_df, sub_events_df, uplift_by_client)
 
     print(f"\nclients: {len(clients_df)} rows")
     print(f"subscription_events: {len(sub_events_df)} rows")
+    print(f"experiment_assignments: {len(assignment_df)} rows")
     print(f"daily_usage: {len(usage_df)} rows")
+
+    print("\nExperiment assignment breakdown by plan tier:")
+    print(assignment_df.groupby(["plan_tier_at_assignment", "group"]).size())
+
+    if uplift_by_client:
+        avg_uplift = sum(uplift_by_client.values()) / len(uplift_by_client)
+        print(f"\n[Ground truth, not written to BigQuery] "
+              f"True average treatment uplift: {avg_uplift:.4f} "
+              f"({len(uplift_by_client)} treatment clients)")
+        print("Per-client true uplift:", {k: round(v, 4) for k, v in uplift_by_client.items()})
 
     bq_client = bigquery.Client(project=PROJECT_ID)
     load_table(bq_client, clients_df, "clients")
     load_table(bq_client, sub_events_df, "subscription_events")
+    load_table(bq_client, assignment_df, "experiment_assignments")
     load_table(bq_client, usage_df, "daily_usage")
 
 

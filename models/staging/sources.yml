@@ -44,3 +44,12 @@ sources:
             description: "Count of feature usage events that day."
           - name: api_calls
             description: "Count of API calls that day."
+      - name: experiment_assignments
+        description: "Treatment/control group assignment per client for the feature-launch A/B test."
+        columns:
+          - name: client_id
+            description: "Foreign key to clients."
+          - name: plan_tier_at_assignment
+            description: "The client's plan tier as of the eligibility date, used for stratification."
+          - name: group
+            description: "Either 'treatment' or 'control'."
