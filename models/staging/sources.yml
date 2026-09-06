@@ -1,0 +1,46 @@
+version: 2
+
+sources:
+  - name: saas_raw
+    database: project-256beac9-89c1-4aed-ab4
+    schema: saas_raw
+    tables:
+      - name: clients
+        description: "One row per client (tenant), with signup date and initial plan."
+        columns:
+          - name: client_id
+            description: "Unique identifier for the client."
+          - name: client_name
+            description: "Client company name."
+          - name: signup_date
+            description: "Date the client signed up."
+          - name: initial_plan
+            description: "The plan tier the client started on."
+
+      - name: subscription_events
+        description: "Plan signup/upgrade/downgrade/churn history per client."
+        columns:
+          - name: client_id
+            description: "Foreign key to clients."
+          - name: event_date
+            description: "Date the subscription event occurred."
+          - name: event_type
+            description: "One of signup, upgrade, downgrade, churn."
+          - name: plan_tier
+            description: "The plan tier as of this event (null on churn)."
+          - name: mrr_amount
+            description: "Monthly recurring revenue amount as of this event."
+
+      - name: daily_usage
+        description: "Daily usage metrics per client."
+        columns:
+          - name: client_id
+            description: "Foreign key to clients."
+          - name: usage_date
+            description: "The date of the usage observation."
+          - name: active_users
+            description: "Count of active users that day."
+          - name: feature_usage_count
+            description: "Count of feature usage events that day."
+          - name: api_calls
+            description: "Count of API calls that day."

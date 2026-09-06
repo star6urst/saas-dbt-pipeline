@@ -1,0 +1,48 @@
+version: 2
+
+models:
+  - name: dim_client
+    description: "One row per client, with current plan and churn status."
+    columns:
+      - name: client_id
+        description: "Primary key."
+        tests:
+          - unique
+          - not_null
+
+  - name: dim_date
+    description: "Calendar date dimension for 2025."
+    columns:
+      - name: calendar_date
+        description: "Primary key."
+        tests:
+          - unique
+          - not_null
+
+  - name: fact_usage_daily
+    description: "Daily usage metrics per client, joined to client and date dimensions."
+    columns:
+      - name: client_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_client')
+                field: client_id
+
+  - name: fact_mrr_monthly
+    description: "Point-in-time monthly recurring revenue per client."
+    columns:
+      - name: client_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_client')
+                field: client_id
+      - name: mrr_amount
+        description: "MRR amount; must be non-negative."
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
